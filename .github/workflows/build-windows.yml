@@ -1,0 +1,226 @@
+name: Build Windows
+
+# نسخة ويندوز من البرنامج (flutter_application_1).
+#
+# فيه لينكين للتحميل:
+#  1) لينك ثابت مابيتغيّرش (GitHub Release بتاج `latest`):
+#     https://github.com/<owner>/<repo>/releases/download/latest/shoon-windows-latest.zip
+#  2) لينك استضافة خارجية (catbox/0x0/bashupload) — بيتغيّر كل بناء،
+#     بيظهر في Actions ← الـ run ← Summary.
+#
+# مفيش `upload-artifact` خالص (كوتة الـ artifacts محدودة). ملفات الـ Release
+# مش محسوبة على نفس الكوتة.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  # نسخة الفلاتر — لازم تكون متوافقة مع sdk: ^3.10.1 في pubspec.yaml.
+  FLUTTER_VERSION: 3.44.0
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # مطلوبة عشان خطوة إنشاء الـ Release تقدر تكتب في الريبو.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # --no-fatal-infos: الكود فيه ملاحظات ستايل كتير (withOpacity, avoid_print...)
+      # مش هنوقف عليها البناء. الـ warnings بتفضل مميتة عشان تمسك المشاكل الحقيقية.
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      # مفيش مجلد test في المشروع دلوقتي — الخطوة بتتخطى نفسها لو مش موجود.
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ -d test ]; then flutter test; else echo "لا يوجد مجلد test — تم التخطي"; fi
+
+      - name: Build Windows release
+        run: flutter build windows --release
+
+      # رقم النسخة من رقم البناء (مفيش تاجات في السيناريو ده).
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: echo "value=build-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Package release folder
+        id: package
+        shell: pwsh
+        run: |
+          $release = "build/windows/x64/runner/Release"
+          if (-not (Test-Path $release)) { throw "Release folder not found at $release" }
+          # عرض محتويات المجلد للتأكد من ملفات التشغيل المطلوبة على الجهاز المستهدف.
+          Get-ChildItem $release | Select-Object Name, Length | Format-Table
+          $zip = "shoon-windows-${{ steps.version.outputs.value }}.zip"
+          Compress-Archive -Path "$release/*" -DestinationPath $zip -Force
+          # نسخة باسم ثابت عشان لينك التحميل ما يتغيّرش مع كل بناء:
+          # .../releases/download/latest/shoon-windows-latest.zip
+          Copy-Item $zip "shoon-windows-latest.zip" -Force
+          $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "الحجم: $mb MB"
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "size=$mb" >> $env:GITHUB_OUTPUT
+
+      # الرفع على استضافة خارجية. بنجرّب أكتر من خدمة بالترتيب وأول واحدة
+      # تنجح بنقف عندها — الخدمات المجانية دي بتتغيّر/بتقع من وقت للتاني.
+      #
+      # 1) catbox.moe   — بيفضل للأبد، حد أقصى 200 ميجا، من غير حساب.
+      # 2) 0x0.st       — بيفضل شهور (المدة بتقل كل ما الملف يكبر)، محتاج User-Agent مخصص.
+      # 3) bashupload   — 3 أيام.
+      # 4) GoFile       — بس لو حاطط GOFILE_TOKEN في Settings ← Secrets ← Actions
+      #                   (الرفع كضيف اتقفل من عندهم).
+      - name: Upload build to external host
+        id: upload
+        shell: pwsh
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+        run: |
+          $zip = "${{ steps.package.outputs.zip }}"
+          $file = Get-Item $zip
+          $url = ''
+          $hostUsed = ''
+
+          function Invoke-UploadAttempt($name, $block) {
+            if ($script:url) { return }
+            Write-Host "--- محاولة الرفع على $name ---"
+            try {
+              $r = & $block
+              if ($r -and "$r" -match 'https?://\S+') {
+                $script:url = $Matches[0].Trim()
+                $script:hostUsed = $name
+                Write-Host "نجح: $script:url"
+              } else {
+                Write-Host "رد غير متوقع من ${name}: $r"
+              }
+            } catch {
+              Write-Host "فشل ${name}: $($_.Exception.Message)"
+            }
+            # الأوامر الخارجية (curl) بتسيب LASTEXITCODE غير صفر ولو عالجنا الفشل،
+            # والـ runner بيفشّل الخطوة على أساسه في الآخر.
+            $global:LASTEXITCODE = 0
+          }
+
+          Invoke-UploadAttempt 'catbox.moe' {
+            Invoke-RestMethod -Uri 'https://catbox.moe/user/api.php' -Method Post `
+              -Form @{ reqtype = 'fileupload'; fileToUpload = $file } -TimeoutSec 1800
+          }
+
+          Invoke-UploadAttempt '0x0.st' {
+            Invoke-RestMethod -Uri 'https://0x0.st' -Method Post `
+              -Headers @{ 'User-Agent' = 'github-actions-windows-build/1.0' } `
+              -Form @{ file = $file } -TimeoutSec 1800
+          }
+
+          Invoke-UploadAttempt 'bashupload.com' {
+            curl.exe -s --max-time 1800 -T "$zip" https://bashupload.com/ | Out-String
+          }
+
+          Invoke-UploadAttempt 'gofile.io' {
+            if (-not $env:GOFILE_TOKEN) { throw 'GOFILE_TOKEN مش متظبط — تم التخطي' }
+            $servers = Invoke-RestMethod -Uri 'https://api.gofile.io/servers' -TimeoutSec 60
+            if ($servers.status -ne 'ok') { throw "servers API returned: $($servers.status)" }
+            $server = $servers.data.servers[0].name
+            $res = Invoke-RestMethod -Uri "https://$server.gofile.io/contents/uploadfile" `
+              -Method Post -Headers @{ Authorization = "Bearer $env:GOFILE_TOKEN" } `
+              -Form @{ file = $file } -TimeoutSec 1800
+            if ($res.status -ne 'ok') { throw "upload returned: $($res.status)" }
+            $res.data.downloadPage
+          }
+
+          if (-not $url) {
+            "## فشل رفع النسخة على كل الاستضافات" >> $env:GITHUB_STEP_SUMMARY
+            throw "كل خدمات الرفع فشلت — شوف اللوج فوق."
+          }
+
+          "url=$url" >> $env:GITHUB_OUTPUT
+
+          $lines = @(
+            '## نسخة ويندوز جاهزة',
+            '',
+            "- **لينك ثابت (مابيتغيّرش):** https://github.com/${{ github.repository }}/releases/download/latest/shoon-windows-latest.zip",
+            "- **لينك مباشر (استضافة خارجية):** $url",
+            "- الاستضافة: $hostUsed",
+            "- الحجم: ${{ steps.package.outputs.size }} MB",
+            "- رقم البناء: ${{ steps.version.outputs.value }}",
+            "- الكوميت: ${{ github.sha }}",
+            '',
+            'نزّل ملف الـ zip، فكّه في أي مجلد، وشغّل flutter_application_1.exe',
+            'كل ملفات التشغيل جوه المجلد — مش محتاج تثبيت.'
+          )
+          $lines -join "`n" >> $env:GITHUB_STEP_SUMMARY
+
+      # تنضيف الأصدارات القديمة من تاج latest: من غيرها كل بناء بيضيف zip جديد
+      # جنب القديم والملفات بتتراكم. بنسيب الملف الحالي + الاسم الثابت بس.
+      - name: Prune old assets on rolling release
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          keep="${{ steps.package.outputs.zip }}"
+          gh release view latest --json assets --jq '.assets[].name' 2>/dev/null \
+            | while read -r asset; do
+                case "$asset" in
+                  "$keep"|"shoon-windows-latest.zip") continue ;;
+                esac
+                echo "deleting old asset: $asset"
+                gh release delete-asset latest "$asset" -y || true
+              done
+
+      # نسخة متجددة من آخر main — نفس اللينك دايماً، بيتحدّث مع كل push.
+      - name: Publish rolling release (latest)
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: أحدث نسخة ويندوز
+          body: |
+            نسخة ويندوز مبنية تلقائياً من آخر تحديث على `main`.
+
+            لينك ثابت لآخر نسخة (مابيتغيّرش):
+            https://github.com/${{ github.repository }}/releases/download/latest/shoon-windows-latest.zip
+
+            - تحميل مباشر بديل: ${{ steps.upload.outputs.url }}
+            - الكوميت: ${{ github.sha }}
+            - رقم البناء: ${{ steps.version.outputs.value }}
+
+            نزّل ملف الـ zip، فكّه في أي مجلد، وشغّل flutter_application_1.exe
+            كل ملفات التشغيل جوه المجلد — مش محتاج تثبيت.
+          prerelease: true
+          files: |
+            ${{ steps.package.outputs.zip }}
+            shoon-windows-latest.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print download links
+        shell: bash
+        run: |
+          echo "=================================================="
+          echo " لينك ثابت: https://github.com/${{ github.repository }}/releases/download/latest/shoon-windows-latest.zip"
+          echo " لينك خارجي: ${{ steps.upload.outputs.url }}"
+          echo "=================================================="
